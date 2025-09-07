@@ -26,12 +26,14 @@ import {
   saveSkipConfig,
   subscribeToDataUpdates,
 } from '@/lib/db.client';
+import { ClientCache } from '@/lib/client-cache';
 import { getDoubanDetails } from '@/lib/douban.client';
 import { SearchResult } from '@/lib/types';
 import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
+import NetDiskSearchResults from '@/components/NetDiskSearchResults';
 
 // 扩展 HTMLVideoElement 类型以支持 hls 属性
 declare global {
@@ -69,6 +71,16 @@ function PlayPageClient() {
   // 豆瓣详情状态
   const [movieDetails, setMovieDetails] = useState<any>(null);
   const [loadingMovieDetails, setLoadingMovieDetails] = useState(false);
+
+  // bangumi详情状态
+  const [bangumiDetails, setBangumiDetails] = useState<any>(null);
+  const [loadingBangumiDetails, setLoadingBangumiDetails] = useState(false);
+
+  // 网盘搜索状态
+  const [netdiskResults, setNetdiskResults] = useState<{ [key: string]: any[] } | null>(null);
+  const [netdiskLoading, setNetdiskLoading] = useState(false);
+  const [netdiskError, setNetdiskError] = useState<string | null>(null);
+  const [netdiskTotal, setNetdiskTotal] = useState(0);
 
   // 跳过片头片尾配置
   const [skipConfig, setSkipConfig] = useState<{
@@ -182,28 +194,59 @@ function PlayPageClient() {
     videoDoubanId,
   ]);
 
-  // 加载豆瓣详情
+  // 加载详情（豆瓣或bangumi）
   useEffect(() => {
     const loadMovieDetails = async () => {
-      if (!videoDoubanId || videoDoubanId === 0 || loadingMovieDetails || movieDetails) {
+      if (!videoDoubanId || videoDoubanId === 0) {
         return;
       }
-      
-      setLoadingMovieDetails(true);
-      try {
-        const response = await getDoubanDetails(videoDoubanId.toString());
-        if (response.code === 200 && response.data) {
-          setMovieDetails(response.data);
+
+      // 检测是否为bangumi ID
+      if (isBangumiId(videoDoubanId)) {
+        // 加载bangumi详情
+        if (loadingBangumiDetails || bangumiDetails) {
+          return;
         }
-      } catch (error) {
-        console.error('Failed to load movie details:', error);
-      } finally {
-        setLoadingMovieDetails(false);
+        
+        setLoadingBangumiDetails(true);
+        try {
+          const bangumiData = await fetchBangumiDetails(videoDoubanId);
+          if (bangumiData) {
+            setBangumiDetails(bangumiData);
+          }
+        } catch (error) {
+          console.error('Failed to load bangumi details:', error);
+        } finally {
+          setLoadingBangumiDetails(false);
+        }
+      } else {
+        // 加载豆瓣详情
+        if (loadingMovieDetails || movieDetails) {
+          return;
+        }
+        
+        setLoadingMovieDetails(true);
+        try {
+          const response = await getDoubanDetails(videoDoubanId.toString());
+          if (response.code === 200 && response.data) {
+            setMovieDetails(response.data);
+          }
+        } catch (error) {
+          console.error('Failed to load movie details:', error);
+        } finally {
+          setLoadingMovieDetails(false);
+        }
       }
     };
 
     loadMovieDetails();
-  }, [videoDoubanId, loadingMovieDetails, movieDetails]);
+  }, [videoDoubanId, loadingMovieDetails, movieDetails, loadingBangumiDetails, bangumiDetails]);
+
+  // 自动网盘搜索：当有视频标题时可以随时搜索
+  useEffect(() => {
+    // 移除自动搜索，改为用户点击按钮时触发
+    // 这样可以避免不必要的API调用
+  }, []);
 
   // 视频播放地址
   const [videoUrl, setVideoUrl] = useState('');
@@ -237,7 +280,7 @@ function PlayPageClient() {
         }
       }
     }
-    return true;
+    return false;
   });
 
   // 保存优选时的测速结果，避免EpisodeSelector重复测速
@@ -245,29 +288,74 @@ function PlayPageClient() {
     Map<string, { quality: string; loadSpeed: string; pingTime: number }>
   >(new Map());
 
-  // 弹幕缓存：避免重复请求相同的弹幕数据，支持页面刷新持久化
-  const DANMU_CACHE_DURATION = 30 * 60 * 1000; // 30分钟缓存
-  const DANMU_CACHE_KEY = 'lunatv_danmu_cache';
+  // 弹幕缓存：避免重复请求相同的弹幕数据，支持页面刷新持久化（统一存储）
+  const DANMU_CACHE_DURATION = 30 * 60; // 30分钟缓存（秒）
+  const DANMU_CACHE_KEY_PREFIX = 'danmu-cache';
   
-  // 获取弹幕缓存
-  const getDanmuCache = (): Map<string, { data: any[]; timestamp: number }> => {
+  // 获取单个弹幕缓存
+  const getDanmuCacheItem = async (key: string): Promise<{ data: any[]; timestamp: number } | null> => {
     try {
-      const cached = localStorage.getItem(DANMU_CACHE_KEY);
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        return new Map(Object.entries(parsed));
+      const cacheKey = `${DANMU_CACHE_KEY_PREFIX}-${key}`;
+      // 优先从统一存储获取
+      const cached = await ClientCache.get(cacheKey);
+      if (cached) return cached;
+      
+      // 兜底：从localStorage获取（兼容性）
+      if (typeof localStorage !== 'undefined') {
+        const oldCacheKey = 'lunatv_danmu_cache';
+        const localCached = localStorage.getItem(oldCacheKey);
+        if (localCached) {
+          const parsed = JSON.parse(localCached);
+          const cacheMap = new Map(Object.entries(parsed));
+          const item = cacheMap.get(key) as { data: any[]; timestamp: number } | undefined;
+          if (item && typeof item.timestamp === 'number' && Date.now() - item.timestamp < DANMU_CACHE_DURATION * 1000) {
+            return item;
+          }
+        }
       }
+      
+      return null;
     } catch (error) {
       console.warn('读取弹幕缓存失败:', error);
+      return null;
     }
-    return new Map();
   };
   
-  // 保存弹幕缓存
-  const setDanmuCache = (cache: Map<string, { data: any[]; timestamp: number }>) => {
+  // 保存单个弹幕缓存
+  const setDanmuCacheItem = async (key: string, data: any[]): Promise<void> => {
     try {
-      const obj = Object.fromEntries(cache.entries());
-      localStorage.setItem(DANMU_CACHE_KEY, JSON.stringify(obj));
+      const cacheKey = `${DANMU_CACHE_KEY_PREFIX}-${key}`;
+      const cacheData = { data, timestamp: Date.now() };
+      
+      // 主要存储：统一存储
+      await ClientCache.set(cacheKey, cacheData, DANMU_CACHE_DURATION);
+      
+      // 兜底存储：localStorage（兼容性，但只存储最近几个）
+      if (typeof localStorage !== 'undefined') {
+        try {
+          const oldCacheKey = 'lunatv_danmu_cache';
+          let localCache: Map<string, { data: any[]; timestamp: number }> = new Map();
+          
+          const existing = localStorage.getItem(oldCacheKey);
+          if (existing) {
+            const parsed = JSON.parse(existing);
+            localCache = new Map(Object.entries(parsed)) as Map<string, { data: any[]; timestamp: number }>;
+          }
+          
+          // 清理过期项并限制数量（最多保留10个）
+          const now = Date.now();
+          const validEntries = Array.from(localCache.entries())
+            .filter(([, item]) => typeof item.timestamp === 'number' && now - item.timestamp < DANMU_CACHE_DURATION * 1000)
+            .slice(-9); // 保留9个，加上新的共10个
+            
+          validEntries.push([key, cacheData]);
+          
+          const obj = Object.fromEntries(validEntries);
+          localStorage.setItem(oldCacheKey, JSON.stringify(obj));
+        } catch (e) {
+          // localStorage可能满了，忽略错误
+        }
+      }
     } catch (error) {
       console.warn('保存弹幕缓存失败:', error);
     }
@@ -300,6 +388,121 @@ function PlayPageClient() {
   // -----------------------------------------------------------------------------
   // 工具函数（Utils）
   // -----------------------------------------------------------------------------
+
+  // bangumi ID检测（6位数字）
+  const isBangumiId = (id: number): boolean => {
+    return id > 0 && id.toString().length === 6;
+  };
+
+  // bangumi缓存配置
+  const BANGUMI_CACHE_EXPIRE = 4 * 60 * 60 * 1000; // 4小时，和douban详情一致
+
+  // bangumi缓存工具函数（统一存储）
+  const getBangumiCache = async (id: number) => {
+    try {
+      const cacheKey = `bangumi-details-${id}`;
+      // 优先从统一存储获取
+      const cached = await ClientCache.get(cacheKey);
+      if (cached) return cached;
+      
+      // 兜底：从localStorage获取（兼容性）
+      if (typeof localStorage !== 'undefined') {
+        const localCached = localStorage.getItem(cacheKey);
+        if (localCached) {
+          const { data, expire } = JSON.parse(localCached);
+          if (Date.now() <= expire) {
+            return data;
+          }
+          localStorage.removeItem(cacheKey);
+        }
+      }
+      
+      return null;
+    } catch (e) {
+      console.warn('获取Bangumi缓存失败:', e);
+      return null;
+    }
+  };
+
+  const setBangumiCache = async (id: number, data: any) => {
+    try {
+      const cacheKey = `bangumi-details-${id}`;
+      const expireSeconds = Math.floor(BANGUMI_CACHE_EXPIRE / 1000); // 转换为秒
+      
+      // 主要存储：统一存储
+      await ClientCache.set(cacheKey, data, expireSeconds);
+      
+      // 兜底存储：localStorage（兼容性）
+      if (typeof localStorage !== 'undefined') {
+        try {
+          const cacheData = {
+            data,
+            expire: Date.now() + BANGUMI_CACHE_EXPIRE,
+            created: Date.now()
+          };
+          localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+        } catch (e) {
+          // localStorage可能满了，忽略错误
+        }
+      }
+    } catch (e) {
+      console.warn('设置Bangumi缓存失败:', e);
+    }
+  };
+
+  // 获取bangumi详情（带缓存）
+  const fetchBangumiDetails = async (bangumiId: number) => {
+    // 检查缓存
+    const cached = await getBangumiCache(bangumiId);
+    if (cached) {
+      console.log(`Bangumi详情缓存命中: ${bangumiId}`);
+      return cached;
+    }
+
+    try {
+      const response = await fetch(`https://api.bgm.tv/v0/subjects/${bangumiId}`);
+      if (response.ok) {
+        const bangumiData = await response.json();
+        
+        // 保存到缓存
+        await setBangumiCache(bangumiId, bangumiData);
+        console.log(`Bangumi详情已缓存: ${bangumiId}`);
+        
+        return bangumiData;
+      }
+    } catch (error) {
+      console.log('Failed to fetch bangumi details:', error);
+    }
+    return null;
+  };
+
+  // 网盘搜索函数
+  const handleNetDiskSearch = async (query: string) => {
+    if (!query.trim()) return;
+
+    setNetdiskLoading(true);
+    setNetdiskError(null);
+    setNetdiskResults(null);
+    setNetdiskTotal(0);
+
+    try {
+      const response = await fetch(`/api/netdisk/search?q=${encodeURIComponent(query.trim())}`);
+      const data = await response.json();
+
+      if (data.success) {
+        setNetdiskResults(data.data.merged_by_type || {});
+        setNetdiskTotal(data.data.total || 0);
+        console.log(`网盘搜索完成: "${query}" - ${data.data.total || 0} 个结果`);
+      } else {
+        setNetdiskError(data.error || '网盘搜索失败');
+      }
+    } catch (error: any) {
+      console.error('网盘搜索请求失败:', error);
+      setNetdiskError('网盘搜索请求失败，请稍后重试');
+    } finally {
+      setNetdiskLoading(false);
+    }
+  };
 
   // 播放源优选函数（针对旧iPad做极端保守优化）
   const preferBestSource = async (
@@ -650,7 +853,7 @@ function PlayPageClient() {
   const isMobileGlobal = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent) || isIOSGlobal;
 
   // 内存压力检测和清理（针对移动设备）
-  const checkMemoryPressure = () => {
+  const checkMemoryPressure = async () => {
     // 仅在支持performance.memory的浏览器中执行
     if (typeof performance !== 'undefined' && 'memory' in performance) {
       try {
@@ -669,7 +872,12 @@ function PlayPageClient() {
           
           // 清理弹幕缓存
           try {
-            localStorage.removeItem(DANMU_CACHE_KEY);
+            // 清理统一存储中的弹幕缓存
+            await ClientCache.clearExpired('danmu-cache');
+            
+            // 兜底清理localStorage中的弹幕缓存（兼容性）
+            const oldCacheKey = 'lunatv_danmu_cache';
+            localStorage.removeItem(oldCacheKey);
             console.log('弹幕缓存已清理');
           } catch (e) {
             console.warn('清理弹幕缓存失败:', e);
@@ -695,7 +903,8 @@ function PlayPageClient() {
     if (!isMobileGlobal) return;
     
     const memoryCheckInterval = setInterval(() => {
-      checkMemoryPressure();
+      // 异步调用内存检查，不阻塞定时器
+      checkMemoryPressure().catch(console.error);
     }, 30000); // 每30秒检查一次
     
     return () => {
@@ -753,8 +962,8 @@ function PlayPageClient() {
           console.log('HLS实例已销毁');
         }
 
-        // 3. 销毁ArtPlayer实例
-        artPlayerRef.current.destroy();
+        // 3. 销毁ArtPlayer实例 - 使用false参数避免清空DOM导致的错误
+        artPlayerRef.current.destroy(false);
         artPlayerRef.current = null;
 
         console.log('播放器资源已清理');
@@ -980,26 +1189,23 @@ function PlayPageClient() {
       console.log('- 豆瓣ID:', currentVideoDoubanId);
       console.log('- 集数:', currentEpisodeNum);
       
-      // 从localStorage获取缓存
-      const danmuCache = getDanmuCache();
-      console.log('- 缓存Map大小:', danmuCache.size);
-
       // 检查缓存
-      const cached = danmuCache.get(cacheKey);
+      console.log('🔍 检查弹幕缓存:', cacheKey);
+      const cached = await getDanmuCacheItem(cacheKey);
       if (cached) {
         console.log('📦 找到缓存数据:');
         console.log('- 缓存时间:', cached.timestamp);
         console.log('- 时间差:', now - cached.timestamp, 'ms');
-        console.log('- 缓存有效期:', DANMU_CACHE_DURATION, 'ms');
-        console.log('- 是否过期:', (now - cached.timestamp) >= DANMU_CACHE_DURATION);
+        console.log('- 缓存有效期:', DANMU_CACHE_DURATION * 1000, 'ms');
+        console.log('- 是否过期:', (now - cached.timestamp) >= (DANMU_CACHE_DURATION * 1000));
+        
+        if ((now - cached.timestamp) < (DANMU_CACHE_DURATION * 1000)) {
+          console.log('✅ 使用弹幕缓存数据，缓存键:', cacheKey);
+          console.log('📊 缓存弹幕数量:', cached.data.length);
+          return cached.data;
+        }
       } else {
         console.log('❌ 未找到缓存数据');
-      }
-      
-      if (cached && (now - cached.timestamp) < DANMU_CACHE_DURATION) {
-        console.log('✅ 使用弹幕缓存数据，缓存键:', cacheKey);
-        console.log('📊 缓存弹幕数量:', cached.data.length);
-        return cached.data;
       }
 
       console.log('开始获取外部弹幕，参数:', params.toString());
@@ -1020,29 +1226,13 @@ function PlayPageClient() {
       console.log('最终弹幕数据:', finalDanmu.length, '条');
       
       // 缓存结果
-      console.log('💾 保存弹幕到缓存:');
+      console.log('💾 保存弹幕到统一存储:');
       console.log('- 缓存键:', cacheKey);
       console.log('- 弹幕数量:', finalDanmu.length);
       console.log('- 保存时间:', now);
       
-      const updatedCache = getDanmuCache();
-      updatedCache.set(cacheKey, {
-        data: finalDanmu,
-        timestamp: now
-      });
-      
-      // 清理过期缓存
-      updatedCache.forEach((value, key) => {
-        if (now - value.timestamp >= DANMU_CACHE_DURATION) {
-          console.log('🗑️ 清理过期缓存:', key);
-          updatedCache.delete(key);
-        }
-      });
-      
-      // 保存到localStorage
-      setDanmuCache(updatedCache);
-      
-      console.log('✅ 缓存保存完成，当前缓存大小:', updatedCache.size);
+      // 保存到统一存储
+      await setDanmuCacheItem(cacheKey, finalDanmu);
       
       return finalDanmu;
     } catch (error) {
@@ -1788,10 +1978,17 @@ function PlayPageClient() {
       cleanupPlayer();
     }
 
+    // 确保 DOM 容器完全清空，避免多实例冲突
+    if (artRef.current) {
+      artRef.current.innerHTML = '';
+    }
+
     try {
       // 创建新的播放器实例
       Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
       Artplayer.USE_RAF = true;
+      // 重新启用5.3.0内存优化功能，但使用false参数避免清空DOM
+      Artplayer.REMOVE_SRC_WHEN_DESTROY = true;
 
       artPlayerRef.current = new Artplayer({
         container: artRef.current,
@@ -1914,7 +2111,8 @@ function PlayPageClient() {
                   ) {
                     artPlayerRef.current.video.hls.destroy();
                   }
-                  artPlayerRef.current.destroy();
+                  // 使用false参数避免清空DOM导致的错误
+                  artPlayerRef.current.destroy(false);
                   artPlayerRef.current = null;
                 }
                 setBlockAdEnabled(newVal);
@@ -2144,7 +2342,7 @@ function PlayPageClient() {
                 visible: localStorage.getItem('danmaku_visible') !== 'false',
                 emitter: false,
                 maxLength: 50,
-                lockTime: 3,
+                lockTime: 2, // v5.2.0优化: 减少锁定时间，降低快进时的延迟
                 theme: 'dark' as const,
                 width: 300,
                 
@@ -2184,21 +2382,25 @@ function PlayPageClient() {
                   return {
                     ...baseConfig,
                     antiOverlap: true, // 开启防重叠
-                    synchronousPlayback: true, // 开启同步播放
+                    synchronousPlayback: true, // 保持弹幕与视频播放速度同步
+                    useWorker: true, // v5.2.0: 启用Web Worker优化
                   }
                 
                 case 'medium': // 中等性能设备 - 适度优化
                   return {
                     ...baseConfig,
                     antiOverlap: !isMobile, // 移动端关闭防重叠
-                    synchronousPlayback: false, // 关闭同步播放计算
+                    synchronousPlayback: true, // 保持同步播放以确保体验一致
+                    useWorker: true, // v5.2.0: 中等设备也启用Worker
                   }
                 
-                case 'low': // 低性能设备 - 激进优化
+                case 'low': // 低性能设备 - 平衡优化
                   return {
                     ...baseConfig,
                     antiOverlap: false, // 关闭复杂的防重叠算法
-                    synchronousPlayback: false, // 关闭同步播放
+                    synchronousPlayback: true, // 保持同步以确保体验，计算量不大
+                    useWorker: true, // 开启Worker减少主线程负担
+                    maxLength: 30, // v5.2.0优化: 减少弹幕数量是关键优化
                   }
               }
             }
@@ -2465,7 +2667,7 @@ function PlayPageClient() {
           }
         });
 
-        // 监听播放进度跳转，优化弹幕重置
+        // 监听播放进度跳转，优化弹幕重置（减少闪烁）
         artPlayerRef.current.on('seek', () => {
           if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
             // 清除之前的重置计时器
@@ -2473,27 +2675,37 @@ function PlayPageClient() {
               clearTimeout(seekResetTimeoutRef.current);
             }
             
-            // 延迟重置弹幕，避免拖拽过程中频繁重置
+            // 增加延迟并只在非拖拽状态下重置，减少快进时的闪烁
             seekResetTimeoutRef.current = setTimeout(() => {
-              if (!isDraggingProgressRef.current && artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+              if (!isDraggingProgressRef.current && artPlayerRef.current?.plugins?.artplayerPluginDanmuku && !artPlayerRef.current.seeking) {
                 artPlayerRef.current.plugins.artplayerPluginDanmuku.reset();
                 console.log('进度跳转，弹幕已重置');
               }
-            }, 200); // 200ms延迟
+            }, 500); // 增加到500ms延迟，减少频繁重置导致的闪烁
           }
         });
 
-        // 监听拖拽状态
+        // 监听拖拽状态 - v5.2.0优化: 在拖拽期间暂停弹幕更新以减少闪烁
         artPlayerRef.current.on('video:seeking', () => {
           isDraggingProgressRef.current = true;
+          // v5.2.0新增: 拖拽时隐藏弹幕，减少CPU占用和闪烁
+          if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku && !artPlayerRef.current.plugins.artplayerPluginDanmuku.isHide) {
+            artPlayerRef.current.plugins.artplayerPluginDanmuku.hide();
+          }
         });
 
         artPlayerRef.current.on('video:seeked', () => {
           isDraggingProgressRef.current = false;
-          // 拖拽结束后再重置弹幕
+          // v5.2.0优化: 拖拽结束后恢复弹幕显示并重置位置
           if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
-            artPlayerRef.current.plugins.artplayerPluginDanmuku.reset();
-            console.log('拖拽结束，弹幕已重置');
+            artPlayerRef.current.plugins.artplayerPluginDanmuku.show(); // 先恢复显示
+            setTimeout(() => {
+              // 延迟重置以确保播放状态稳定
+              if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+                artPlayerRef.current.plugins.artplayerPluginDanmuku.reset();
+                console.log('拖拽结束，弹幕已重置');
+              }
+            }, 100);
           }
         });
 
@@ -3014,6 +3226,39 @@ function PlayPageClient() {
                 >
                   <FavoriteIcon filled={favorited} />
                 </button>
+                
+                {/* 网盘资源提示按钮 */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    // 触发网盘搜索（如果还没搜索过）
+                    if (!netdiskResults && !netdiskLoading && videoTitle) {
+                      handleNetDiskSearch(videoTitle);
+                    }
+                    // 滚动到网盘区域
+                    setTimeout(() => {
+                      const element = document.getElementById('netdisk-section');
+                      if (element) {
+                        element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }
+                    }, 100);
+                  }}
+                  className='ml-3 flex-shrink-0 hover:opacity-90 transition-all duration-200 hover:scale-105'
+                >
+                  <div className='flex items-center gap-1.5 bg-blue-500 hover:bg-blue-600 text-white px-3 py-1.5 rounded-full text-sm font-medium shadow-md'>
+                    📁
+                    {netdiskLoading ? (
+                      <span className='flex items-center gap-1'>
+                        <span className='inline-block h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin'></span>
+                        搜索中...
+                      </span>
+                    ) : netdiskTotal > 0 ? (
+                      <span>{netdiskTotal}个网盘资源</span>
+                    ) : (
+                      <span>网盘资源</span>
+                    )}
+                  </div>
+                </button>
               </h1>
 
               {/* 关键信息行 */}
@@ -3034,16 +3279,96 @@ function PlayPageClient() {
                 {detail?.type_name && <span>{detail.type_name}</span>}
               </div>
 
-              {/* 豆瓣详细信息 */}
+              {/* 详细信息（豆瓣或bangumi） */}
               {videoDoubanId && videoDoubanId !== 0 && (
                 <div className='mb-4 flex-shrink-0'>
-                  {loadingMovieDetails && !movieDetails && (
+                  {/* 加载状态 */}
+                  {(loadingMovieDetails || loadingBangumiDetails) && !movieDetails && !bangumiDetails && (
                     <div className='animate-pulse'>
                       <div className='h-4 bg-gray-300 rounded w-64 mb-2'></div>
                       <div className='h-4 bg-gray-300 rounded w-48'></div>
                     </div>
                   )}
                   
+                  {/* Bangumi详情 */}
+                  {bangumiDetails && (
+                    <div className='space-y-2 text-sm'>
+                      {/* Bangumi评分 */}
+                      {bangumiDetails.rating?.score && (
+                        <div className='flex items-center gap-2'>
+                          <span className='font-semibold text-gray-700 dark:text-gray-300'>Bangumi评分: </span>
+                          <div className='flex items-center'>
+                            <span className='text-yellow-600 dark:text-yellow-400 font-bold text-base'>
+                              {bangumiDetails.rating.score}
+                            </span>
+                            <div className='flex ml-1'>
+                              {[...Array(5)].map((_, i) => (
+                                <svg
+                                  key={i}
+                                  className={`w-3 h-3 ${
+                                    i < Math.floor(parseFloat(bangumiDetails.rating.score) / 2)
+                                      ? 'text-yellow-500'
+                                      : 'text-gray-300 dark:text-gray-600'
+                                  }`}
+                                  fill='currentColor'
+                                  viewBox='0 0 20 20'
+                                >
+                                  <path d='M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z' />
+                                </svg>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 制作信息从infobox提取 */}
+                      {bangumiDetails.infobox && bangumiDetails.infobox.map((info: any, index: number) => {
+                        if (info.key === '导演' && info.value) {
+                          const directors = Array.isArray(info.value) ? info.value.map((v: any) => v.v || v).join('、') : info.value;
+                          return (
+                            <div key={index}>
+                              <span className='font-semibold text-gray-700 dark:text-gray-300'>导演: </span>
+                              <span className='text-gray-600 dark:text-gray-400'>{directors}</span>
+                            </div>
+                          );
+                        }
+                        if (info.key === '制作' && info.value) {
+                          const studios = Array.isArray(info.value) ? info.value.map((v: any) => v.v || v).join('、') : info.value;
+                          return (
+                            <div key={index}>
+                              <span className='font-semibold text-gray-700 dark:text-gray-300'>制作: </span>
+                              <span className='text-gray-600 dark:text-gray-400'>{studios}</span>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })}
+                      
+                      {/* 播出日期 */}
+                      {bangumiDetails.date && (
+                        <div>
+                          <span className='font-semibold text-gray-700 dark:text-gray-300'>播出日期: </span>
+                          <span className='text-gray-600 dark:text-gray-400'>{bangumiDetails.date}</span>
+                        </div>
+                      )}
+                      
+                      {/* 标签信息 */}
+                      <div className='flex flex-wrap gap-2 mt-3'>
+                        {bangumiDetails.tags && bangumiDetails.tags.slice(0, 4).map((tag: any, index: number) => (
+                          <span key={index} className='bg-blue-200 dark:bg-blue-800 text-blue-800 dark:text-blue-200 px-2 py-1 rounded-full text-xs'>
+                            {tag.name}
+                          </span>
+                        ))}
+                        {bangumiDetails.total_episodes && (
+                          <span className='bg-green-200 dark:bg-green-800 text-green-800 dark:text-green-200 px-2 py-1 rounded-full text-xs'>
+                            共{bangumiDetails.total_episodes}话
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 豆瓣详情 */}
                   {movieDetails && (
                     <div className='space-y-2 text-sm'>
                       {/* 豆瓣评分 */}
@@ -3149,14 +3474,52 @@ function PlayPageClient() {
                 </div>
               )}
               {/* 剧情简介 */}
-              {detail?.desc && (
+              {(detail?.desc || bangumiDetails?.summary) && (
                 <div
                   className='mt-0 text-base leading-relaxed opacity-90 overflow-y-auto pr-2 flex-1 min-h-0 scrollbar-hide'
                   style={{ whiteSpace: 'pre-line' }}
                 >
-                  {detail.desc}
+                  {bangumiDetails?.summary || detail?.desc}
                 </div>
               )}
+              
+              {/* 网盘资源区域 */}
+              <div id="netdisk-section" className='mt-6'>
+                <div className='border-t border-gray-200 dark:border-gray-700 pt-6'>
+                  <div className='mb-4'>
+                    <h3 className='text-xl font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2'>
+                      📁 网盘资源
+                      {netdiskLoading && (
+                        <span className='inline-block align-middle'>
+                          <span className='inline-block h-4 w-4 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin'></span>
+                        </span>
+                      )}
+                      {netdiskTotal > 0 && (
+                        <span className='inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300'>
+                          {netdiskTotal} 个资源
+                        </span>
+                      )}
+                    </h3>
+                    {videoTitle && !netdiskLoading && !netdiskResults && (
+                      <p className='text-sm text-gray-500 dark:text-gray-400 mt-2'>
+                        点击上方"📁 网盘资源"按钮开始搜索
+                      </p>
+                    )}
+                    {videoTitle && !netdiskLoading && (netdiskResults || netdiskError) && (
+                      <p className='text-sm text-gray-500 dark:text-gray-400 mt-2'>
+                        搜索关键词：{videoTitle}
+                      </p>
+                    )}
+                  </div>
+                  
+                  <NetDiskSearchResults
+                    results={netdiskResults}
+                    loading={netdiskLoading}
+                    error={netdiskError}
+                    total={netdiskTotal}
+                  />
+                </div>
+              </div>
             </div>
           </div>
 
@@ -3164,23 +3527,27 @@ function PlayPageClient() {
           <div className='hidden md:block md:col-span-1 md:order-first'>
             <div className='pl-0 py-4 pr-6'>
               <div className='relative bg-gray-300 dark:bg-gray-700 aspect-[2/3] flex items-center justify-center rounded-xl overflow-hidden'>
-                {videoCover ? (
+                {(videoCover || bangumiDetails?.images?.large) ? (
                   <>
                     <img
-                      src={processImageUrl(videoCover)}
+                      src={processImageUrl(bangumiDetails?.images?.large || videoCover)}
                       alt={videoTitle}
                       className='w-full h-full object-cover'
                     />
 
-                    {/* 豆瓣链接按钮 */}
+                    {/* 链接按钮（bangumi或豆瓣） */}
                     {videoDoubanId !== 0 && (
                       <a
-                        href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
+                        href={
+                          bangumiDetails 
+                            ? `https://bgm.tv/subject/${videoDoubanId.toString()}`
+                            : `https://movie.douban.com/subject/${videoDoubanId.toString()}`
+                        }
                         target='_blank'
                         rel='noopener noreferrer'
                         className='absolute top-3 left-3'
                       >
-                        <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
+                        <div className={`${bangumiDetails ? 'bg-pink-500 hover:bg-pink-600' : 'bg-green-500 hover:bg-green-600'} text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:scale-[1.1] transition-all duration-300 ease-out`}>
                           <svg
                             width='16'
                             height='16'
