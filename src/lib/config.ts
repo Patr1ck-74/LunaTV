@@ -348,8 +348,7 @@ export async function configSelfCheck(adminConfig: AdminConfig): Promise<AdminCo
         return existingUserConfig;
       } else {
         // 新用户，创建默认配置
-        // 🔧 修复：优先从数据库获取真实注册时间，避免OIDC/Telegram用户被错误清理
-        let createdAt = Date.now(); // 默认使用当前时间
+        let createdAt = Date.now();
         let oidcSub: string | undefined;
         let tags: string[] | undefined;
         let role: 'owner' | 'admin' | 'user' = username === ownerUser ? 'owner' : 'user';
@@ -357,7 +356,7 @@ export async function configSelfCheck(adminConfig: AdminConfig): Promise<AdminCo
         let enabledApis: string[] | undefined;
 
         try {
-          // 1️⃣ 优先：从数据库V2获取真实注册时间（OIDC/新版用户）
+          // 从数据库V2获取用户信息（OIDC/新版用户）
           const userInfoV2 = await db.getUserInfoV2(username);
           if (userInfoV2) {
             createdAt = userInfoV2.createdAt || Date.now();
@@ -366,20 +365,9 @@ export async function configSelfCheck(adminConfig: AdminConfig): Promise<AdminCo
             role = userInfoV2.role || role;
             banned = userInfoV2.banned || false;
             enabledApis = userInfoV2.enabledApis;
-          } else {
-            // 2️⃣ 次选：从登录统计推断注册时间（旧版用户）
-            const userStats = await db.getUserPlayStat(username);
-            if (userStats.firstLoginTime) {
-              createdAt = userStats.firstLoginTime;
-            } else if (userStats.lastLoginTime) {
-              createdAt = userStats.lastLoginTime;
-            } else if (userStats.lastLoginDate) {
-              createdAt = userStats.lastLoginDate;
-            }
           }
         } catch (err) {
-          // 3️⃣ 最后：获取失败时使用当前时间
-          console.warn(`获取用户 ${username} 注册时间失败，使用当前时间作为 createdAt:`, err);
+          console.warn(`获取用户 ${username} 信息失败:`, err);
         }
 
         const newUserConfig: any = {
@@ -471,6 +459,44 @@ export async function configSelfCheck(adminConfig: AdminConfig): Promise<AdminCo
     adminConfig.DownloadConfig = {
       enabled: true,                                    // 默认启用下载功能
     };
+  }
+
+  // 🔥 OIDC 配置迁移：从单 Provider 迁移到多 Provider
+  if (adminConfig.OIDCAuthConfig && !adminConfig.OIDCProviders) {
+    // 自动识别 Provider ID
+    let providerId = 'custom';
+    const issuer = adminConfig.OIDCAuthConfig.issuer?.toLowerCase() || '';
+
+    if (issuer.includes('google') || issuer.includes('accounts.google.com')) {
+      providerId = 'google';
+    } else if (issuer.includes('github')) {
+      providerId = 'github';
+    } else if (issuer.includes('microsoft') || issuer.includes('login.microsoftonline.com')) {
+      providerId = 'microsoft';
+    } else if (issuer.includes('linux.do') || issuer.includes('connect.linux.do')) {
+      providerId = 'linuxdo';
+    }
+
+    // 迁移到新格式
+    adminConfig.OIDCProviders = [{
+      id: providerId,
+      name: adminConfig.OIDCAuthConfig.buttonText || providerId.toUpperCase(),
+      enabled: adminConfig.OIDCAuthConfig.enabled,
+      enableRegistration: adminConfig.OIDCAuthConfig.enableRegistration,
+      issuer: adminConfig.OIDCAuthConfig.issuer,
+      authorizationEndpoint: adminConfig.OIDCAuthConfig.authorizationEndpoint,
+      tokenEndpoint: adminConfig.OIDCAuthConfig.tokenEndpoint,
+      userInfoEndpoint: adminConfig.OIDCAuthConfig.userInfoEndpoint,
+      clientId: adminConfig.OIDCAuthConfig.clientId,
+      clientSecret: adminConfig.OIDCAuthConfig.clientSecret,
+      buttonText: adminConfig.OIDCAuthConfig.buttonText,
+      minTrustLevel: adminConfig.OIDCAuthConfig.minTrustLevel || 0,
+    }];
+
+    console.log(`[Config Migration] Migrated OIDCAuthConfig to OIDCProviders with provider: ${providerId}`);
+
+    // 保留旧配置一段时间以防回滚需要
+    // delete adminConfig.OIDCAuthConfig;
   }
 
   // 站长变更自检
